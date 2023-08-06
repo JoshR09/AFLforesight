@@ -1,0 +1,769 @@
+---
+title: "AFLxMargin"
+author: "Josh Ryan"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r, include=FALSE}
+library(fitzRoy)
+library(dplyr)
+library(purrr)
+```
+
+# Introduction
+
+AFLxMargin is a multiple regression model used to predict the margin of AFL
+games. Past AFL data is scraped from the web using the fitzRoy package, and
+used as the predictors of the model. The predictors of the model are:
+
+* The margin of the last match up between the two teams
+* The number of wins each team has in their last 5 games
+* The ladder positions of the teams
+
+The model always predicts the margin from the perspective of the home team in
+the match up. As a result, it can be thought that the home ground advantage is
+also considered as an implicit predictor through the intercept of the model.
+
+# The function for the model
+Given below is the R code for the function of the model, which will produce a
+prediction for a match given a round number and a match id, corresponding
+to where that match lands in the fixture (e.g. 2nd match will have id = 2).
+Note that the function as given below is currently card coded to only account for
+the 2023 season.
+
+```{r}
+# Function for parsing ladder form string
+parse_form_string <- function(string) {
+  split_string <- strsplit(string, "")[[1]]
+  
+  result <- 0
+  
+  for (letter in split_string) {
+    if (letter == "W") {
+      result <- result + 1
+    } else if (letter == "D") {
+      result <- result + 0.5
+    }
+  }
+  
+  return( result)
+}
+
+# Function for getting last n characters of a string
+substrRight <- function(x, n){
+  substr(x, nchar(x)-n+1, nchar(x))
+}
+
+# Main model function
+afl_x_margin <- function(round_number, match_id) {
+  round_info <- fetch_fixture(2023, round = round_number) %>% 
+    select(home.team.abbreviation, away.team.abbreviation) %>% 
+    mutate(id = row_number()) %>% 
+    rename("home_team" = "home.team.abbreviation",
+           "away_team" = "away.team.abbreviation")
+  
+  chosen_match_info <- round_info %>% filter(id == match_id) %>% select(home_team, away_team)
+  
+  # Fetch previous x matches
+  previous_round_info <- data.frame()
+  
+  for (round in 6:round_number-1) { # starts at 6 to allow for past 5 game form
+    round_data <- fetch_fixture(2023, round = round) %>% 
+      select(home.team.abbreviation, away.team.abbreviation,
+             home.score.totalScore, away.score.totalScore) %>% 
+      rename("home_team" = "home.team.abbreviation",
+             "away_team" = "away.team.abbreviation",
+             "home_score" = "home.score.totalScore",
+             "away_score" = "away.score.totalScore") %>% 
+      mutate(round_no = round)
+    
+    previous_round_info <- bind_rows(previous_round_info, round_data)
+  }
+  
+  # Get margin from scores
+  previous_round_info <- previous_round_info %>%
+    mutate(margin = home_score - away_score)
+  
+  # Fetch ladder positions
+  ladder_positions <- fetch_ladder() %>%
+    select(team.abbreviation, position)
+  
+  # Bind ladder positions with previous_round_info
+  previous_round_info <- previous_round_info %>%
+    left_join(ladder_positions, by = c("home_team" = "team.abbreviation")) %>%
+    rename(home_position = position) %>%
+    left_join(ladder_positions, by = c("away_team" = "team.abbreviation")) %>%
+    rename(away_position = position)
+  
+  # Fetch scores of last match-up between teams
+  season_results <- fetch_results(2023)
+  last_season_results <- fetch_results(2022)
+  for (row in 1:nrow(previous_round_info)) {
+    season_matchup_info <- season_results %>%  arrange(desc(row_number())) %>%
+      filter(match.homeTeam.abbr == previous_round_info[row, "home_team"] |
+               match.homeTeam.abbr == previous_round_info[row, "away_team"],
+             match.awayTeam.abbr == previous_round_info[row, "away_team"] |
+               match.awayTeam.abbr == previous_round_info[row, "home_team"]) %>% 
+      select(homeTeamScore.matchScore.totalScore,
+             awayTeamScore.matchScore.totalScore, match.homeTeam.abbr)
+    
+    last_season_matchup_info <- last_season_results %>% arrange(desc(row_number())) %>%
+      filter(match.homeTeam.abbr == previous_round_info[row, "home_team"] |
+               match.homeTeam.abbr == previous_round_info[row, "away_team"],
+             match.awayTeam.abbr == previous_round_info[row, "away_team"] |
+               match.awayTeam.abbr == previous_round_info[row, "home_team"]) %>% 
+      select(homeTeamScore.matchScore.totalScore,
+             awayTeamScore.matchScore.totalScore, match.homeTeam.abbr)
+    
+    matchup_info <- bind_rows(season_matchup_info, last_season_matchup_info)
+    
+    if (previous_round_info[row, "home_team"] == matchup_info[2, "match.homeTeam.abbr"]) {
+      previous_round_info[row, "previous_match_home_score"] <- matchup_info[2, "homeTeamScore.matchScore.totalScore"]
+      previous_round_info[row, "previous_match_away_score"] <- matchup_info[2, "awayTeamScore.matchScore.totalScore"]
+    } else {
+      previous_round_info[row, "previous_match_home_score"] <- matchup_info[2, "awayTeamScore.matchScore.totalScore"]
+      previous_round_info[row, "previous_match_away_score"] <- matchup_info[2, "homeTeamScore.matchScore.totalScore"]
+    }
+  }
+  
+  # Get margin from total scores
+  previous_round_info <- previous_round_info %>%
+    mutate(last_match_margin = previous_match_home_score - previous_match_away_score)
+  
+  # Select only necessary columns
+  previous_round_info <- previous_round_info %>% 
+    select(home_team, away_team, margin, home_position, away_position, last_match_margin, round_no)
+  
+  # Get wins in last 5 games for team being predicted
+  for (row in 1:nrow(previous_round_info)) {
+    previous_round_info[row, "predicted_form"] <- fetch_ladder(2023, round_number = previous_round_info[row, "round_no"]) %>%
+      filter(team.abbreviation == previous_round_info[row, "home_team"]) %>% 
+      select(form)
+  }
+  
+  for (row in 1:nrow(previous_round_info)) {
+    previous_round_info[row, "predicted_form"] = previous_round_info[row, "predicted_form"] %>% 
+      substrRight(5)
+  }
+  
+  previous_round_info <- previous_round_info %>%
+    mutate(wins_in_last_5 = map_chr(predicted_form, parse_form_string))
+  
+  previous_round_info <- previous_round_info %>%
+    select(-predicted_form)
+  
+  # Get wins in last 5 games for opponent team
+  for (row in 1:nrow(previous_round_info)) {
+    previous_round_info[row, "opponent_form"] <- fetch_ladder(2023, round_number = previous_round_info[row, "round_no"]) %>%
+      filter(team.abbreviation == previous_round_info[row, "away_team"]) %>% 
+      select(form)
+  }
+  
+  for (row in 1:nrow(previous_round_info)) {
+    previous_round_info[row, "opponent_form"] = previous_round_info[row, "opponent_form"] %>% 
+      substrRight(5)
+  }
+  
+  previous_round_info <- previous_round_info %>%
+    mutate(opponent_wins_in_last_5 = map_chr(opponent_form, parse_form_string))
+  
+  previous_round_info <- previous_round_info %>%
+    select(-opponent_form)
+  
+  previous_round_info$wins_in_last_5 <- 
+    as.numeric(previous_round_info$wins_in_last_5)
+  previous_round_info$opponent_wins_in_last_5 <- 
+    as.numeric(previous_round_info$opponent_wins_in_last_5)
+  
+  # Get all player stats for the season up to round 16
+  season_stats <- data.frame()
+  for (round in 1:round_number-1) {
+    round_stats <- fetch_player_stats(season = 2023, round_number = round)
+    season_stats <- bind_rows(season_stats, round_stats)
+  }
+  
+  # Get sum of ranking points of lineup from each home player's last 5 games
+  for (row in 1:nrow(previous_round_info)) {
+    home_lineup <- fetch_lineup(2023, previous_round_info[row, "round_no"]) %>%
+      filter(teamAbbr == previous_round_info[row, "home_team"])
+    
+    home_rating <- 0
+    
+    for (prow in 1:nrow(home_lineup)) { # iterate over each player
+      if (home_lineup[prow, "position"] %>% pull() != "EMERG") {
+        player <- home_lineup[prow, ]
+        
+        pstats <- season_stats %>% 
+          filter(player.player.player.playerId ==
+                   player[1, "player.playerId"] %>% pull()) %>% 
+          tail(5)
+        
+        home_rating <- home_rating + sum(pstats$dreamTeamPoints)
+      }
+    }
+    
+    previous_round_info[row, "home_rating"] <- home_rating
+  }
+  
+  # Get sum of ranking points of lineup from each away player's last 5 games
+  for (row in 1:nrow(previous_round_info)) {
+    away_lineup <- fetch_lineup(2023, previous_round_info[row, "round_no"]) %>%
+      filter(teamAbbr == previous_round_info[row, "away_team"])
+    
+    away_rating <- 0
+    
+    for (prow in 1:nrow(away_lineup)) { # iterate over each player
+      if (away_lineup[prow, "position"] %>% pull() != "EMERG") {
+        player <- away_lineup[prow, ]
+        
+        pstats <- season_stats %>% 
+          filter(player.player.player.playerId ==
+                   player[1, "player.playerId"] %>% pull()) %>% 
+          tail(5)
+        
+        away_rating <- away_rating + sum(pstats$dreamTeamPoints)
+      }
+    }
+    
+    previous_round_info[row, "away_rating"] <- away_rating
+  }
+  
+  model <- lm(margin ~ home_position + away_position + last_match_margin + 
+                wins_in_last_5 + opponent_wins_in_last_5 + home_rating + 
+                away_rating, data = previous_round_info)
+  
+  # Fetch ladder positions
+  ladder_positions <- fetch_ladder() %>%
+    select(team.abbreviation, position)
+  
+  # Bind ladder positions with chosen_match_info
+  chosen_match_info <- chosen_match_info %>%
+    left_join(ladder_positions, by = c("home_team" = "team.abbreviation")) %>%
+    rename(home_position = position) %>%
+    left_join(ladder_positions, by = c("away_team" = "team.abbreviation")) %>%
+    rename(away_position = position)
+  
+  # Fetch scores of last match-up between teams
+  season_matchup_info <- fetch_results() %>%  arrange(desc(row_number())) %>%
+    filter(match.homeTeam.abbr == chosen_match_info[1, "home_team"] %>% pull |
+             match.homeTeam.abbr == chosen_match_info[1, "away_team"] %>% pull,
+           match.awayTeam.abbr == chosen_match_info[1, "away_team"] %>% pull |
+             match.awayTeam.abbr == chosen_match_info[1, "home_team"] %>% pull) %>% 
+    select(homeTeamScore.matchScore.totalScore,
+           awayTeamScore.matchScore.totalScore, match.homeTeam.abbr)
+  
+  last_season_matchup_info <- fetch_results(2022) %>% arrange(desc(row_number())) %>%
+    filter(match.homeTeam.abbr == chosen_match_info[1, "home_team"] %>% pull |
+             match.homeTeam.abbr == chosen_match_info[1, "away_team"] %>% pull,
+           match.awayTeam.abbr == chosen_match_info[1, "away_team"] %>% pull |
+             match.awayTeam.abbr == chosen_match_info[1, "home_team"] %>% pull) %>% 
+    select(homeTeamScore.matchScore.totalScore,
+           awayTeamScore.matchScore.totalScore, match.homeTeam.abbr)
+  
+  matchup_info <- bind_rows(season_matchup_info, last_season_matchup_info)
+  
+  if (chosen_match_info[1, "home_team"] == matchup_info[1, "match.homeTeam.abbr"]) {
+    chosen_match_info[1, "previous_match_home_score"] <- matchup_info[1, "homeTeamScore.matchScore.totalScore"]
+    chosen_match_info[1, "previous_match_away_score"] <- matchup_info[1, "awayTeamScore.matchScore.totalScore"]
+  } else {
+    chosen_match_info[1, "previous_match_home_score"] <- matchup_info[1, "awayTeamScore.matchScore.totalScore"]
+    chosen_match_info[1, "previous_match_away_score"] <- matchup_info[1, "homeTeamScore.matchScore.totalScore"]
+  }
+  
+  # Get margin from total scores
+  chosen_match_info <- chosen_match_info %>%
+    mutate(last_match_margin = previous_match_home_score - previous_match_away_score)
+  
+  # Get wins in last 5 games for home team
+  chosen_match_info[1, "home_form"] <- fetch_ladder(2023) %>%
+    filter(team.abbreviation == chosen_match_info[1, "home_team"] %>% pull()) %>% 
+    select(form)
+  
+  chosen_match_info[1, "home_form"] = chosen_match_info[1, "home_form"] %>% 
+    substrRight(5)
+  
+  chosen_match_info <- chosen_match_info %>%
+    mutate(wins_in_last_5 = map_chr(home_form, parse_form_string))
+  
+  # Get wins in last 5 games for away team
+  chosen_match_info[1, "away_form"] <- fetch_ladder(2023) %>%
+    filter(team.abbreviation == chosen_match_info[1, "away_team"] %>% pull()) %>% 
+    select(form)
+  
+  chosen_match_info[1, "away_form"] = chosen_match_info[1, "away_form"] %>% 
+    substrRight(5)
+  
+  chosen_match_info <- chosen_match_info %>%
+    mutate(opponent_wins_in_last_5 = map_chr(away_form, parse_form_string))
+  
+  chosen_match_info <- chosen_match_info %>%
+    select(-previous_match_home_score, -previous_match_away_score, 
+           -home_form, -away_form)
+  
+  chosen_match_info$wins_in_last_5 <- 
+    as.numeric(chosen_match_info$wins_in_last_5)
+  chosen_match_info$opponent_wins_in_last_5 <- 
+    as.numeric(chosen_match_info$opponent_wins_in_last_5)
+  
+  # Get all player stats for the season up to round 16
+  season_stats <- data.frame()
+  for (round in 1:round_number-1) {
+    round_stats <- fetch_player_stats(season = 2023, round_number = round)
+    season_stats <- bind_rows(season_stats, round_stats)
+  }
+  
+  # Get sum of ranking points of lineup from each home player's last 5 games
+  home_lineup <- fetch_lineup(2023, 16) %>%
+    filter(teamAbbr == chosen_match_info[1, "home_team"] %>% pull())
+  
+  home_rating <- 0
+  
+  for (prow in 1:nrow(home_lineup)) { # iterate over each player
+    if (home_lineup[prow, "position"] %>% pull() != "EMERG") {
+      player <- home_lineup[prow, ]
+      
+      pstats <- season_stats %>% 
+        filter(player.player.player.playerId ==
+                 player[1, "player.playerId"] %>% pull()) %>% 
+        tail(5)
+      
+      home_rating <- home_rating + sum(pstats$dreamTeamPoints)
+    }
+  }
+  
+  chosen_match_info[1, "home_rating"] <- home_rating
+  
+  # Get sum of ranking points of lineup from each away player's last 5 games
+  
+  away_lineup <- fetch_lineup(2023, 16) %>%
+    filter(teamAbbr == chosen_match_info[1, "away_team"] %>% pull())
+  
+  away_rating <- 0
+  
+  for (prow in 1:nrow(away_lineup)) { # iterate over each player
+    if (away_lineup[prow, "position"] %>% pull() != "EMERG") {
+      player <- away_lineup[prow, ]
+      
+      pstats <- season_stats %>% 
+        filter(player.player.player.playerId ==
+                 player[1, "player.playerId"] %>% pull()) %>% 
+        tail(5)
+      
+      away_rating <- away_rating + sum(pstats$dreamTeamPoints)
+    }
+  }
+  
+  chosen_match_info[1, "away_rating"] <- away_rating
+  
+  model_result <- predict(model, newdata = chosen_match_info)
+  
+  return(model_result)
+}
+```
+
+Here is an example output of the model for a match between Essendon and Adelaide
+in Round 17 of the 2023 season, where Essendon are the home team:
+
+```{r}
+afl_x_margin(17, 8)
+```
+
+This result should be interpreted as an expected margin of 9.83 in Essendon's
+favor.
+
+# Hard-coded example
+The following is a hard coded example of the model, used to predict the result
+of a match between Geelong and North Melbourne in round 17 of the 2023 season,
+where Geelong is the home team.
+
+Function for parsing ladder form string:
+```{r}
+parse_form_string <- function(string) {
+  split_string <- strsplit(string, "")[[1]]
+  
+  result <- 0
+  
+  for (letter in split_string) {
+    if (letter == "W") {
+      result <- result + 1
+    } else if (letter == "D") {
+      result <- result + 0.5
+    }
+  }
+  
+  return( result)
+}
+```
+
+Function for getting last n characters of a string:
+```{r}
+substrRight <- function(x, n){
+  substr(x, nchar(x)-n+1, nchar(x))
+}
+```
+
+Scraping fixture information for given round:
+```{r}
+round_info <- fetch_fixture(2023, round = 17) %>% 
+  select(home.team.abbreviation, away.team.abbreviation) %>% 
+  mutate(id = row_number()) %>% 
+  rename("home_team" = "home.team.abbreviation",
+         "away_team" = "away.team.abbreviation")
+```
+
+Get teams for individual match:
+```{r}
+chosen_match_info <- round_info %>% filter(id == 7) %>% select(home_team, away_team)
+```
+
+Fetch predictor data for previous 5 matches from perspective of home team:
+```{r}
+# Fetch previous x matches
+previous_round_info <- data.frame()
+
+for (round in 6:16) {
+  round_data <- fetch_fixture(2023, round = round) %>% 
+    select(home.team.abbreviation, away.team.abbreviation,
+           home.score.totalScore, away.score.totalScore) %>% 
+    rename("home_team" = "home.team.abbreviation",
+           "away_team" = "away.team.abbreviation",
+           "home_score" = "home.score.totalScore",
+           "away_score" = "away.score.totalScore") %>% 
+    mutate(round_no = round)
+  
+  previous_round_info <- bind_rows(previous_round_info, round_data)
+}
+
+# Get margin from scores
+previous_round_info <- previous_round_info %>%
+  mutate(margin = home_score - away_score)
+
+# Fetch ladder positions
+ladder_positions <- fetch_ladder() %>%
+  select(team.abbreviation, position)
+
+# Bind ladder positions with previous_round_info
+previous_round_info <- previous_round_info %>%
+  left_join(ladder_positions, by = c("home_team" = "team.abbreviation")) %>%
+  rename(home_position = position) %>%
+  left_join(ladder_positions, by = c("away_team" = "team.abbreviation")) %>%
+  rename(away_position = position)
+
+# Fetch scores of last match-up between teams
+season_results <- fetch_results(2023)
+last_season_results <- fetch_results(2022)
+for (row in 1:nrow(previous_round_info)) {
+  season_matchup_info <- season_results %>%  arrange(desc(row_number())) %>%
+    filter(match.homeTeam.abbr == previous_round_info[row, "home_team"] |
+           match.homeTeam.abbr == previous_round_info[row, "away_team"],
+           match.awayTeam.abbr == previous_round_info[row, "away_team"] |
+           match.awayTeam.abbr == previous_round_info[row, "home_team"]) %>% 
+    select(homeTeamScore.matchScore.totalScore,
+           awayTeamScore.matchScore.totalScore, match.homeTeam.abbr)
+  
+  last_season_matchup_info <- last_season_results %>% arrange(desc(row_number())) %>%
+    filter(match.homeTeam.abbr == previous_round_info[row, "home_team"] |
+           match.homeTeam.abbr == previous_round_info[row, "away_team"],
+           match.awayTeam.abbr == previous_round_info[row, "away_team"] |
+           match.awayTeam.abbr == previous_round_info[row, "home_team"]) %>% 
+    select(homeTeamScore.matchScore.totalScore,
+           awayTeamScore.matchScore.totalScore, match.homeTeam.abbr)
+  
+  matchup_info <- bind_rows(season_matchup_info, last_season_matchup_info)
+  
+  if (previous_round_info[row, "home_team"] == matchup_info[2, "match.homeTeam.abbr"]) {
+    previous_round_info[row, "previous_match_home_score"] <- matchup_info[2, "homeTeamScore.matchScore.totalScore"]
+    previous_round_info[row, "previous_match_away_score"] <- matchup_info[2, "awayTeamScore.matchScore.totalScore"]
+  } else {
+    previous_round_info[row, "previous_match_home_score"] <- matchup_info[2, "awayTeamScore.matchScore.totalScore"]
+    previous_round_info[row, "previous_match_away_score"] <- matchup_info[2, "homeTeamScore.matchScore.totalScore"]
+  }
+}
+
+# Get margin from total scores
+previous_round_info <- previous_round_info %>%
+  mutate(last_match_margin = previous_match_home_score - previous_match_away_score)
+
+# Select only necessary columns
+previous_round_info <- previous_round_info %>% 
+  select(home_team, away_team, margin, home_position, away_position, last_match_margin, round_no)
+
+# Get wins in last 5 games for team being predicted
+for (row in 1:nrow(previous_round_info)) {
+  previous_round_info[row, "predicted_form"] <- fetch_ladder(2023, round_number = previous_round_info[row, "round_no"]) %>%
+    filter(team.abbreviation == previous_round_info[row, "home_team"]) %>% 
+    select(form)
+}
+
+for (row in 1:nrow(previous_round_info)) {
+  previous_round_info[row, "predicted_form"] = previous_round_info[row, "predicted_form"] %>% 
+    substrRight(5)
+}
+
+previous_round_info <- previous_round_info %>%
+  mutate(wins_in_last_5 = map_chr(predicted_form, parse_form_string))
+
+previous_round_info <- previous_round_info %>%
+  select(-predicted_form)
+
+# Get wins in last 5 games for opponent team
+for (row in 1:nrow(previous_round_info)) {
+  previous_round_info[row, "opponent_form"] <- fetch_ladder(2023, round_number = previous_round_info[row, "round_no"]) %>%
+    filter(team.abbreviation == previous_round_info[row, "away_team"]) %>% 
+    select(form)
+}
+
+for (row in 1:nrow(previous_round_info)) {
+  previous_round_info[row, "opponent_form"] = previous_round_info[row, "opponent_form"] %>% 
+    substrRight(5)
+}
+
+previous_round_info <- previous_round_info %>%
+  mutate(opponent_wins_in_last_5 = map_chr(opponent_form, parse_form_string))
+
+previous_round_info <- previous_round_info %>%
+  select(-opponent_form)
+
+previous_round_info$wins_in_last_5 <- 
+  as.numeric(previous_round_info$wins_in_last_5)
+previous_round_info$opponent_wins_in_last_5 <- 
+  as.numeric(previous_round_info$opponent_wins_in_last_5)
+
+# Get all player stats for the season up to round 16
+season_stats <- data.frame()
+for (round in 1:16) {
+  round_stats <- fetch_player_stats(season = 2023, round_number = round)
+  season_stats <- bind_rows(season_stats, round_stats)
+}
+
+# Get sum of ranking points of lineup from each home player's last 5 games
+for (row in 1:nrow(previous_round_info)) {
+  home_lineup <- fetch_lineup(2023, previous_round_info[row, "round_no"]) %>%
+    filter(teamAbbr == previous_round_info[row, "home_team"])
+  
+  home_rating <- 0
+  
+  for (prow in 1:nrow(home_lineup)) { # iterate over each player
+    if (home_lineup[prow, "position"] %>% pull() != "EMERG") {
+      player <- home_lineup[prow, ]
+    
+    pstats <- season_stats %>% 
+      filter(player.player.player.playerId ==
+               player[1, "player.playerId"] %>% pull()) %>% 
+      tail(3)
+    
+    home_rating <- home_rating + sum(pstats$ratingPoints)
+    }
+  }
+  
+  previous_round_info[row, "home_rating"] <- home_rating
+}
+
+# Get sum of ranking points of lineup from each away player's last 5 games
+for (row in 1:nrow(previous_round_info)) {
+  away_lineup <- fetch_lineup(2023, previous_round_info[row, "round_no"]) %>%
+    filter(teamAbbr == previous_round_info[row, "away_team"])
+  
+  away_rating <- 0
+  
+  for (prow in 1:nrow(away_lineup)) { # iterate over each player
+    if (away_lineup[prow, "position"] %>% pull() != "EMERG") {
+      player <- away_lineup[prow, ]
+  
+      pstats <- season_stats %>% 
+        filter(player.player.player.playerId ==
+                 player[1, "player.playerId"] %>% pull()) %>% 
+        tail(3)
+      
+      away_rating <- away_rating + sum(pstats$ratingPoints)
+    }
+  }
+  
+  previous_round_info[row, "away_rating"] <- away_rating
+}
+```
+
+Estimate parameters of multiple linear regression model:
+```{r}
+model <- lm(margin ~ home_position + away_position + last_match_margin + 
+              wins_in_last_5 + opponent_wins_in_last_5 + home_rating + 
+              away_rating, data = previous_round_info)
+summary(model)
+```
+
+Assemble predictor data for this match from perspective of home team:
+```{r}
+# Fetch ladder positions
+ladder_positions <- fetch_ladder() %>%
+  select(team.abbreviation, position)
+
+# Bind ladder positions with chosen_match_info
+chosen_match_info <- chosen_match_info %>%
+  left_join(ladder_positions, by = c("home_team" = "team.abbreviation")) %>%
+  rename(home_position = position) %>%
+  left_join(ladder_positions, by = c("away_team" = "team.abbreviation")) %>%
+  rename(away_position = position)
+
+# Fetch scores of last match-up between teams
+season_matchup_info <- fetch_results() %>%  arrange(desc(row_number())) %>%
+  filter(match.homeTeam.abbr == chosen_match_info[1, "home_team"] %>% pull |
+         match.homeTeam.abbr == chosen_match_info[1, "away_team"] %>% pull,
+         match.awayTeam.abbr == chosen_match_info[1, "away_team"] %>% pull |
+         match.awayTeam.abbr == chosen_match_info[1, "home_team"] %>% pull) %>% 
+  select(homeTeamScore.matchScore.totalScore,
+         awayTeamScore.matchScore.totalScore, match.homeTeam.abbr)
+
+last_season_matchup_info <- fetch_results(2022) %>% arrange(desc(row_number())) %>%
+  filter(match.homeTeam.abbr == chosen_match_info[1, "home_team"] %>% pull |
+         match.homeTeam.abbr == chosen_match_info[1, "away_team"] %>% pull,
+         match.awayTeam.abbr == chosen_match_info[1, "away_team"] %>% pull |
+         match.awayTeam.abbr == chosen_match_info[1, "home_team"] %>% pull) %>% 
+  select(homeTeamScore.matchScore.totalScore,
+         awayTeamScore.matchScore.totalScore, match.homeTeam.abbr)
+  
+matchup_info <- bind_rows(season_matchup_info, last_season_matchup_info)
+  
+if (chosen_match_info[1, "home_team"] == matchup_info[1, "match.homeTeam.abbr"]) {
+  chosen_match_info[1, "previous_match_home_score"] <- matchup_info[1, "homeTeamScore.matchScore.totalScore"]
+  chosen_match_info[1, "previous_match_away_score"] <- matchup_info[1, "awayTeamScore.matchScore.totalScore"]
+} else {
+  chosen_match_info[1, "previous_match_home_score"] <- matchup_info[1, "awayTeamScore.matchScore.totalScore"]
+  chosen_match_info[1, "previous_match_away_score"] <- matchup_info[1, "homeTeamScore.matchScore.totalScore"]
+}
+
+# Get margin from total scores
+chosen_match_info <- chosen_match_info %>%
+  mutate(last_match_margin = previous_match_home_score - previous_match_away_score)
+
+# Get wins in last 5 games for home team
+chosen_match_info[1, "home_form"] <- fetch_ladder(2023) %>%
+  filter(team.abbreviation == chosen_match_info[1, "home_team"] %>% pull()) %>% 
+  select(form)
+
+chosen_match_info[1, "home_form"] = chosen_match_info[1, "home_form"] %>% 
+  substrRight(5)
+
+chosen_match_info <- chosen_match_info %>%
+  mutate(wins_in_last_5 = map_chr(home_form, parse_form_string))
+
+# Get wins in last 5 games for away team
+chosen_match_info[1, "away_form"] <- fetch_ladder(2023) %>%
+  filter(team.abbreviation == chosen_match_info[1, "away_team"] %>% pull()) %>% 
+  select(form)
+
+chosen_match_info[1, "away_form"] = chosen_match_info[1, "away_form"] %>% 
+  substrRight(5)
+
+chosen_match_info <- chosen_match_info %>%
+  mutate(opponent_wins_in_last_5 = map_chr(away_form, parse_form_string))
+
+chosen_match_info <- chosen_match_info %>%
+  select(-previous_match_home_score, -previous_match_away_score, 
+         -home_form, -away_form)
+
+chosen_match_info$wins_in_last_5 <- 
+  as.numeric(chosen_match_info$wins_in_last_5)
+chosen_match_info$opponent_wins_in_last_5 <- 
+  as.numeric(chosen_match_info$opponent_wins_in_last_5)
+
+# Get all player stats for the season up to round 16
+season_stats <- data.frame()
+for (round in 1:16) {
+  round_stats <- fetch_player_stats(season = 2023, round_number = round)
+  season_stats <- bind_rows(season_stats, round_stats)
+}
+
+# Get sum of ranking points of lineup from each home player's last 5 games
+home_lineup <- fetch_lineup(2023, 16) %>%
+  filter(teamAbbr == chosen_match_info[1, "home_team"] %>% pull())
+
+home_rating <- 0
+
+for (prow in 1:nrow(home_lineup)) { # iterate over each player
+  if (home_lineup[prow, "position"] %>% pull() != "EMERG") {
+    player <- home_lineup[prow, ]
+    
+    pstats <- season_stats %>% 
+      filter(player.player.player.playerId ==
+               player[1, "player.playerId"] %>% pull()) %>% 
+      tail(3)
+    
+    home_rating <- home_rating + sum(pstats$ratingPoints)
+  }
+}
+  
+chosen_match_info[1, "home_rating"] <- home_rating
+
+# Get sum of ranking points of lineup from each away player's last 5 games
+
+away_lineup <- fetch_lineup(2023, 16) %>%
+  filter(teamAbbr == chosen_match_info[1, "away_team"] %>% pull())
+
+away_rating <- 0
+
+for (prow in 1:nrow(away_lineup)) { # iterate over each player
+  if (away_lineup[prow, "position"] %>% pull() != "EMERG") {
+    player <- away_lineup[prow, ]
+  
+    pstats <- season_stats %>% 
+      filter(player.player.player.playerId ==
+              player[1, "player.playerId"] %>% pull()) %>% 
+      tail(3)
+      
+    away_rating <- away_rating + sum(pstats$ratingPoints)
+  }
+}
+  
+chosen_match_info[1, "away_rating"] <- away_rating
+
+```
+
+Predict margin using model:
+```{r}
+predict(model, newdata = chosen_match_info)
+```
+
+This margin should be interpreted as an expected Geelong win by 48.07 points.
+
+Here are some residual plots of the model against the training data:
+```{r}
+# Calculate residuals
+res <- resid(model)
+
+# Create a new plot with customized settings
+par(mfrow = c(1, 2))  # Divide the plot into two columns
+
+# Plot residuals vs. fitted values
+plot(fitted(model), res,
+     main = "Residuals vs. Fitted",
+     xlab = "Fitted Values",
+     ylab = "Residuals",
+     pch = 20,  # Set point character to filled circles
+     col = "blue"  # Set point color to blue
+)
+
+# Add a horizontal line at y = 0
+abline(h = 0, col = "red", lty = 2)  # Use a dashed red line
+
+# Plot a histogram of residuals
+hist(res,
+     main = "Histogram of Residuals",
+     xlab = "Residuals",
+     ylab = "Frequency",
+     col = "lightblue",  # Set histogram color to light blue
+     border = "white",   # Set border color to white
+     breaks = "FD"       # Use the Freedman-Diaconis rule for bin width
+)
+
+# Add a normal curve to the histogram
+curve(dnorm(x, mean = mean(res), sd = sd(res)),
+      add = TRUE,
+      col = "darkblue",
+      lwd = 2
+)
+```
+
